@@ -56,7 +56,8 @@ impl<'rb> RingBuffer<'rb> {
         let record_length: usize = msg.len() + AERON_RB_RECORD_HEADER_LENGTH;
         let record_index = self.claim_capacity(record_length)?;
 
-        let record_header: *mut RecordDescriptor = self.buffer[0].get() as *mut RecordDescriptor;
+        let record_header: *mut RecordDescriptor =
+            self.buffer[record_index as usize].get() as *mut RecordDescriptor;
 
         aeron_put_ordered_i32(&unsafe { &*record_header }.length, -(record_length as i32)); // Probably wrong, should likely be an atomic (lets see if loom caches this).
 
@@ -140,7 +141,7 @@ impl<'rb> RingBuffer<'rb> {
 
         loop {
             // DO STUFF
-            aeron_get_volatile_i64(&mut tail, &self.descriptor.head_cache_position);
+            aeron_get_volatile_i64(&mut tail, &self.descriptor.tail_position);
 
             let available_capacity = self.capacity - (tail as usize - head as usize);
 
@@ -337,7 +338,7 @@ mod tests {
 
         let message = (88, [54, 33, 77, 11, 123]);
 
-        writer.write(message.0, &message.1);
+        writer.write(message.0, &message.1).unwrap();
 
         let mut received = reader.read(1);
 
@@ -346,5 +347,60 @@ mod tests {
         let received_message = received.remove(0);
         assert_eq!(received_message.0, message.0);
         assert_eq!(received_message.1, message.1);
+    }
+
+    #[test]
+    fn read_write_read_multiple_messages() {
+        let buffer = [0u8; 1024 + size_of::<Descriptor>()];
+
+        let mut reader = unsafe { RingBuffer::new(buffer.as_ptr(), buffer.len()) }.unwrap();
+        let mut writer = unsafe { RingBuffer::new(buffer.as_ptr(), buffer.len()) }.unwrap();
+
+        let message_one = (88, [54, 33, 77, 11, 123]);
+
+        writer.write(message_one.0, &message_one.1).unwrap();
+
+        let mut received = reader.read(1);
+
+        assert_eq!(received.len(), 1);
+
+        let received_message = received.remove(0);
+        assert_eq!(received_message.0, message_one.0);
+        assert_eq!(received_message.1, message_one.1);
+
+        let message_two = (94, [44, 11]);
+
+        writer.write(message_two.0, &message_two.1).unwrap();
+
+        let mut received = reader.read(1);
+
+        assert_eq!(received.len(), 1);
+
+        let received_message = received.remove(0);
+        assert_eq!(received_message.0, message_two.0);
+        assert_eq!(received_message.1, message_two.1);
+    }
+
+    #[test]
+    fn write_read_single_message_multithread() {
+        let buffer = [0u8; 1024 + size_of::<Descriptor>()];
+
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let message = (88, [54, 33, 77, 11, 123]);
+                let mut writer = unsafe { RingBuffer::new(buffer.as_ptr(), buffer.len()) }.unwrap();
+                writer.write(message.0, &message.1).unwrap();
+            });
+            s.spawn(|| {
+                let mut reader = unsafe { RingBuffer::new(buffer.as_ptr(), buffer.len()) }.unwrap();
+                let mut received = reader.read(1);
+
+                assert_eq!(received.len(), 1);
+
+                let received_message = received.remove(0);
+                assert_eq!(received_message.0, 88);
+                assert_eq!(received_message.1, [54, 33, 77, 11, 123]);
+            });
+        })
     }
 }
