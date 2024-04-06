@@ -351,10 +351,12 @@ mod tests {
 
     #[test]
     fn read_write_read_multiple_messages() {
-        let buffer = [0u8; 1024 + size_of::<Descriptor>()];
+        let mut buffer = [0u8; 1024 + size_of::<Descriptor>()];
 
-        let mut reader = unsafe { RingBuffer::new(buffer.as_ptr(), buffer.len()) }.unwrap();
-        let mut writer = unsafe { RingBuffer::new(buffer.as_ptr(), buffer.len()) }.unwrap();
+        let mut reader =
+            unsafe { RingBuffer::new(buffer.as_mut_ptr() as *const u8, buffer.len()) }.unwrap();
+        let mut writer =
+            unsafe { RingBuffer::new(buffer.as_mut_ptr() as *const u8, buffer.len()) }.unwrap();
 
         let message_one = (88, [54, 33, 77, 11, 123]);
 
