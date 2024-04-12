@@ -95,6 +95,8 @@ pub(crate) struct SenderDescriptor {
     pub head_position: ReadOnlyHead,
 }
 
+unsafe impl Send for SenderDescriptor {}
+
 impl From<Descriptor> for SenderDescriptor {
     fn from(descriptor: Descriptor) -> Self {
         Self {
@@ -110,6 +112,8 @@ pub(crate) struct ReceiverDescriptor {
     pub head_cache_position: ReadOnlyHeadCache,
     pub head_position: ReadWriteHead,
 }
+
+unsafe impl Send for ReceiverDescriptor {}
 
 impl From<Descriptor> for ReceiverDescriptor {
     fn from(descriptor: Descriptor) -> Self {
@@ -274,17 +278,11 @@ impl ReadOnlyTail {
 
 #[cfg(test)]
 mod tests {
-    use std::alloc::alloc;
-    use std::alloc::Layout;
-    use std::cell::UnsafeCell;
-    use std::mem::MaybeUninit;
     use std::mem::{align_of, offset_of, size_of};
 
-    use crate::descriptor::RawDescriptor;
-    // use crate::RingBufferData;
     use crate::AERON_CACHE_LINE_LENGTH;
 
-    use super::Descriptor;
+    use super::RawDescriptor;
 
     #[test]
     fn ringbuffer_descriptor_layout_alignment() {

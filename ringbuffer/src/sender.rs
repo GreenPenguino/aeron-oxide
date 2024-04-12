@@ -17,6 +17,8 @@ pub struct Sender {
     pub(crate) max_message_length: usize,
 }
 
+unsafe impl Send for Sender {}
+
 impl Sender {
     pub unsafe fn new(buffer: *mut u8, length: usize) -> Result<Self, ()> {
         todo!()

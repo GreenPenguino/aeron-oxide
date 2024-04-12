@@ -221,24 +221,18 @@ fn aeron_align(value: usize, alignment: usize) -> usize {
 mod tests {
     use std::alloc::alloc;
     use std::alloc::Layout;
-    use std::cell::UnsafeCell;
-    use std::mem::MaybeUninit;
-    use std::mem::{align_of, offset_of, size_of};
 
-    use crate::descriptor::RawDescriptor;
-    use crate::AERON_CACHE_LINE_LENGTH;
+    use crate::AERON_RB_TRAILER_LENGTH;
 
-    use super::Descriptor;
     use super::RingBuffer;
 
     #[test]
     fn read_write_read_single_message() {
         const BUFFER_SIZE: usize = 1024;
-        const LENGTH: usize = BUFFER_SIZE + size_of::<RawDescriptor>();
+        const LENGTH: usize = BUFFER_SIZE + AERON_RB_TRAILER_LENGTH;
         let layout = Layout::from_size_align(LENGTH, BUFFER_SIZE).unwrap();
         let buffer = unsafe { alloc(layout) } as *mut u8;
         unsafe { buffer.write_bytes(0, BUFFER_SIZE) };
-        // let mut buffer = unsafe { MaybeUninit::<[u8; length]>::zeroed().assume_init() };
 
         let (mut sender, mut receiver) = unsafe { RingBuffer::new(buffer, BUFFER_SIZE) }
             .unwrap()
@@ -257,62 +251,64 @@ mod tests {
         assert_eq!(received_message.1, message.1);
     }
 
-    // #[test]
-    // fn read_write_read_multiple_messages() {
-    //     let mut buffer = [0u8; 1024 + size_of::<Descriptor>()];
+    #[test]
+    fn read_write_read_multiple_messages() {
+        let mut buffer = [0u8; 1024 + AERON_RB_TRAILER_LENGTH];
 
-    //     let mut reader =
-    //         unsafe { RingBuffer::new(buffer.as_mut_ptr() as *mut u8, buffer.len()) }.unwrap();
-    //     let mut writer =
-    //         unsafe { RingBuffer::new(buffer.as_mut_ptr() as *mut u8, buffer.len()) }.unwrap();
+        let (mut sender, mut receiver) =
+            unsafe { RingBuffer::new(buffer.as_mut_ptr(), buffer.len()) }
+                .unwrap()
+                .split();
 
-    //     let message_one = (88, [54, 33, 77, 11, 123]);
+        let message_one = (88, [54, 33, 77, 11, 123]);
 
-    //     writer.write(message_one.0, &message_one.1).unwrap();
+        sender.send(message_one.0, &message_one.1).unwrap();
 
-    //     let mut received = reader.read(1);
+        let mut received = receiver.receive(1);
 
-    //     assert_eq!(received.len(), 1);
+        assert_eq!(received.len(), 1);
 
-    //     let received_message = received.remove(0);
-    //     assert_eq!(received_message.0, message_one.0);
-    //     assert_eq!(received_message.1, message_one.1);
+        let received_message = received.remove(0);
+        assert_eq!(received_message.0, message_one.0);
+        assert_eq!(received_message.1, message_one.1);
 
-    //     let message_two = (94, [44, 11]);
+        let message_two = (94, [44, 11]);
 
-    //     writer.write(message_two.0, &message_two.1).unwrap();
+        sender.send(message_two.0, &message_two.1).unwrap();
 
-    //     let mut received = reader.read(1);
+        let mut received = receiver.receive(1);
 
-    //     assert_eq!(received.len(), 1);
+        assert_eq!(received.len(), 1);
 
-    //     let received_message = received.remove(0);
-    //     assert_eq!(received_message.0, message_two.0);
-    //     assert_eq!(received_message.1, message_two.1);
-    // }
+        let received_message = received.remove(0);
+        assert_eq!(received_message.0, message_two.0);
+        assert_eq!(received_message.1, message_two.1);
+    }
 
-    // #[test]
-    // fn write_read_single_message_multithread() {
-    //     let mut buffer = [0u8; 1024 + size_of::<Descriptor>()];
+    #[test]
+    fn write_read_single_message_multithread() {
+        let mut buffer = [0u8; 1024 + AERON_RB_TRAILER_LENGTH];
 
-    //     std::thread::scope(|s| {
-    //         let ptr_1 = buffer.as_mut_ptr();
-    //         let ptr_2 = buffer.as_mut_ptr();
-    //         s.spawn(move || {
-    //             let message = (88, [54, 33, 77, 11, 123]);
-    //             let mut writer = unsafe { RingBuffer::new(ptr_1, buffer.len()) }.unwrap();
-    //             writer.write(message.0, &message.1).unwrap();
-    //         });
-    //         s.spawn(|| {
-    //             let mut reader = unsafe { RingBuffer::new(ptr_2, buffer.len()) }.unwrap();
-    //             let mut received = reader.read(1);
+        std::thread::scope(|s| {
+            let (mut sender, mut receiver) =
+                unsafe { RingBuffer::new(buffer.as_mut_ptr(), buffer.len()) }
+                    .unwrap()
+                    .split();
 
-    //             assert_eq!(received.len(), 1);
+            s.spawn(move || {
+                let message = (88, [54, 33, 77, 11, 123]);
+                sender.send(message.0, &message.1).unwrap();
+            });
 
-    //             let received_message = received.remove(0);
-    //             assert_eq!(received_message.0, 88);
-    //             assert_eq!(received_message.1, [54, 33, 77, 11, 123]);
-    //         });
-    //     })
-    // }
+            s.spawn(move || {
+                let mut received = receiver.receive(1);
+
+                assert_eq!(received.len(), 1);
+
+                let received_message = received.remove(0);
+                assert_eq!(received_message.0, 88);
+                assert_eq!(received_message.1, [54, 33, 77, 11, 123]);
+            });
+        })
+    }
 }

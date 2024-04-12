@@ -17,6 +17,8 @@ pub struct Receiver {
     pub(crate) _max_message_length: usize,
 }
 
+unsafe impl Send for Receiver {}
+
 impl Receiver {
     // simplified version of read without handler.
     // TODO: implement full version
