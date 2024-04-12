@@ -1,12 +1,17 @@
+#![allow(dead_code, unused_variables)]
+
 pub mod descriptor;
+pub mod receiver;
+pub mod sender;
 
 // #![allow(dead_code, unused_variables)]
 
-use core::slice;
 use descriptor::{Descriptor, RawDescriptor};
+use receiver::Receiver;
+use sender::Sender;
 use std::{
     mem::size_of,
-    ptr::{self, addr_of_mut, NonNull},
+    ptr::NonNull,
     sync::atomic::{compiler_fence, AtomicI32, AtomicI64, Ordering},
 };
 
@@ -23,8 +28,8 @@ const AERON_RB_PADDING_MSG_TYPE_ID: i32 = -1;
 #[derive(Debug)]
 pub struct RingBuffer {
     buffer: NonNull<u8>,
-    descriptor: Descriptor,
     capacity: usize,
+    descriptor: Descriptor,
     max_message_length: usize,
 }
 
@@ -47,165 +52,104 @@ impl RingBuffer {
         }
     }
 
-    pub fn write(&mut self, msg_type_id: i32, msg: &[u8]) -> Result<(), ()> {
-        if msg.len() > self.max_message_length || aeron_rb_invalid_msg_type_id(msg_type_id) {
-            return Err(());
-        }
-
-        let record_length: usize = msg.len() + AERON_RB_RECORD_HEADER_LENGTH;
-        let record_index = self.claim_capacity(record_length)?;
-
-        let record_header: *mut RecordDescriptor =
-            unsafe { self.buffer.as_ptr().byte_add(record_index as usize) }
-                as *mut RecordDescriptor;
-
-        aeron_put_ordered_i32(&unsafe { &*record_header }.length, -(record_length as i32)); // Probably wrong, should likely be an atomic (lets see if loom caches this).
-
-        let index = aeron_rb_message_offset(record_index as usize);
-        let destination_ptr: *mut u8 = unsafe { self.buffer.as_ptr().byte_add(index) };
-        unsafe { ptr::copy_nonoverlapping(msg.as_ptr(), destination_ptr, msg.len()) };
-
-        unsafe { &mut *record_header }.msg_type_id = msg_type_id;
-        aeron_put_ordered_i32(&unsafe { &*record_header }.length, record_length as i32);
-
-        Ok(())
+    pub fn split(self) -> (Sender, Receiver) {
+        (
+            Sender {
+                buffer: self.buffer,
+                capacity: self.capacity,
+                descriptor: self.descriptor.into(),
+                max_message_length: self.max_message_length,
+            },
+            Receiver {
+                buffer: self.buffer,
+                capacity: self.capacity,
+                descriptor: self.descriptor.into(),
+                _max_message_length: self.max_message_length,
+            },
+        )
     }
 
-    // simplified version of read without handler.
-    // TODO: implement full version
-    pub fn read(&mut self, message_count_limit: usize) -> Vec<(i32, Vec<u8>)> {
-        let head: i64 = self.descriptor.head_position().load(Ordering::Relaxed);
-        let head_index: usize = head as usize & (self.capacity - 1);
-        let contiguous_block_length: usize = self.capacity - head_index;
-        let mut messages_read: usize = 0;
-        let mut bytes_read: usize = 0;
+    // pub fn write(&mut self, msg_type_id: i32, msg: &[u8]) -> Result<(), ()> {
+    //     if msg.len() > self.max_message_length || aeron_rb_invalid_msg_type_id(msg_type_id) {
+    //         return Err(());
+    //     }
 
-        // TODO: replace buffer by message handler
-        let mut read_buffer: Vec<(i32, Vec<u8>)> = Vec::new();
+    //     let record_length: usize = msg.len() + AERON_RB_RECORD_HEADER_LENGTH;
+    //     let record_index = self.claim_capacity(record_length)?;
 
-        while bytes_read < contiguous_block_length && messages_read < message_count_limit {
-            let record_index: usize = head_index + bytes_read;
-            let header: &RecordDescriptor = {
-                let ptr: *mut u8 = unsafe { self.buffer.as_ptr().byte_add(record_index) };
-                unsafe { &*(ptr as *const RecordDescriptor) }
-            };
+    //     let record_header: *mut RecordDescriptor =
+    //         unsafe { self.buffer.as_ptr().byte_add(record_index as usize) }
+    //             as *mut RecordDescriptor;
 
-            let mut record_length: i32 = 0;
-            aeron_get_volatile_i32(&mut record_length, &header.length);
+    //     aeron_put_ordered_i32(&unsafe { &*record_header }.length, -(record_length as i32)); // Probably wrong, should likely be an atomic (lets see if loom caches this).
 
-            if record_length <= 0 {
-                break;
-            }
+    //     let index = aeron_rb_message_offset(record_index as usize);
+    //     let destination_ptr: *mut u8 = unsafe { self.buffer.as_ptr().byte_add(index) };
+    //     unsafe { ptr::copy_nonoverlapping(msg.as_ptr(), destination_ptr, msg.len()) };
 
-            bytes_read += aeron_align(record_length as usize, AERON_RB_ALIGNMENT);
-            let msg_type_id: i32 = header.msg_type_id;
+    //     unsafe { &mut *record_header }.msg_type_id = msg_type_id;
+    //     aeron_put_ordered_i32(&unsafe { &*record_header }.length, record_length as i32);
 
-            if msg_type_id == AERON_RB_PADDING_MSG_TYPE_ID {
-                continue;
-            }
+    //     Ok(())
+    // }
 
-            messages_read += 1;
-            let data: &[u8] = {
-                let index = aeron_rb_message_offset(record_index);
-                let ptr = unsafe { self.buffer.as_ptr().byte_add(index) };
-                unsafe {
-                    slice::from_raw_parts(
-                        ptr,
-                        record_length as usize - AERON_RB_RECORD_HEADER_LENGTH,
-                    )
-                }
-            };
-            read_buffer.push((msg_type_id, data.to_vec()));
-        }
+    // // simplified version of read without handler.
+    // // TODO: implement full version
+    // pub fn read(&mut self, message_count_limit: usize) -> Vec<(i32, Vec<u8>)> {
+    //     let head: i64 = self.descriptor.head_position().load(Ordering::Relaxed);
+    //     let head_index: usize = head as usize & (self.capacity - 1);
+    //     let contiguous_block_length: usize = self.capacity - head_index;
+    //     let mut messages_read: usize = 0;
+    //     let mut bytes_read: usize = 0;
 
-        if bytes_read != 0 {
-            // Set all the bytes read to 0 with memset
-            let destination_ptr: *mut u8 = unsafe { self.buffer.as_ptr().byte_add(head_index) };
-            unsafe { destination_ptr.write_bytes(0, bytes_read) };
-            aeron_put_ordered_i64(self.descriptor.head_position(), head + bytes_read as i64);
-        }
+    //     // TODO: replace buffer by message handler
+    //     let mut read_buffer: Vec<(i32, Vec<u8>)> = Vec::new();
 
-        // return vec
-        read_buffer
-    }
+    //     while bytes_read < contiguous_block_length && messages_read < message_count_limit {
+    //         let record_index: usize = head_index + bytes_read;
+    //         let header: &RecordDescriptor = {
+    //             let ptr: *mut u8 = unsafe { self.buffer.as_ptr().byte_add(record_index) };
+    //             unsafe { &*(ptr as *const RecordDescriptor) }
+    //         };
 
-    // TODO: check if result can be changed to u32
-    fn claim_capacity(&mut self, record_length: usize) -> Result<i32, ()> {
-        let required_capacity: usize = aeron_align(record_length, AERON_RB_ALIGNMENT);
-        let mask: usize = self.capacity - 1;
-        let mut head: i64 = 0;
-        let mut tail: i64 = 0;
-        let mut tail_index: usize;
-        let mut padding: usize;
+    //         let mut record_length: i32 = 0;
+    //         aeron_get_volatile_i32(&mut record_length, &header.length);
 
-        aeron_get_volatile_i64(&mut head, self.descriptor.head_cache_position());
+    //         if record_length <= 0 {
+    //             break;
+    //         }
 
-        loop {
-            // DO STUFF
-            aeron_get_volatile_i64(&mut tail, self.descriptor.tail_position());
+    //         bytes_read += aeron_align(record_length as usize, AERON_RB_ALIGNMENT);
+    //         let msg_type_id: i32 = header.msg_type_id;
 
-            let available_capacity = self.capacity - (tail as usize - head as usize);
+    //         if msg_type_id == AERON_RB_PADDING_MSG_TYPE_ID {
+    //             continue;
+    //         }
 
-            if required_capacity > available_capacity {
-                aeron_get_volatile_i64(&mut head, self.descriptor.head_position());
+    //         messages_read += 1;
+    //         let data: &[u8] = {
+    //             let index = aeron_rb_message_offset(record_index);
+    //             let ptr = unsafe { self.buffer.as_ptr().byte_add(index) };
+    //             unsafe {
+    //                 slice::from_raw_parts(
+    //                     ptr,
+    //                     record_length as usize - AERON_RB_RECORD_HEADER_LENGTH,
+    //                 )
+    //             }
+    //         };
+    //         read_buffer.push((msg_type_id, data.to_vec()));
+    //     }
 
-                if required_capacity > (self.capacity - (tail as usize - head as usize)) {
-                    return Err(());
-                }
+    //     if bytes_read != 0 {
+    //         // Set all the bytes read to 0 with memset
+    //         let destination_ptr: *mut u8 = unsafe { self.buffer.as_ptr().byte_add(head_index) };
+    //         unsafe { destination_ptr.write_bytes(0, bytes_read) };
+    //         aeron_put_ordered_i64(self.descriptor.head_position(), head + bytes_read as i64);
+    //     }
 
-                aeron_put_ordered_i64(self.descriptor.head_cache_position(), head);
-            }
-
-            padding = 0;
-            tail_index = tail as usize & mask;
-            let to_buffer_end_length = self.capacity - tail_index;
-
-            if required_capacity > to_buffer_end_length {
-                // The message doesn't fit between tail index and end of buffer.
-
-                let mut head_index = head as usize & mask;
-
-                if required_capacity > head_index {
-                    // The message doesn't fit between start of buffer and **cached** head index.
-
-                    aeron_get_volatile_i64(&mut head, self.descriptor.head_position());
-                    head_index = head as usize & mask;
-
-                    if required_capacity > head_index {
-                        // The message doesn't fit between start of buffer and head index.
-                        return Err(());
-                    }
-
-                    aeron_put_ordered_i64(self.descriptor.head_cache_position(), head);
-                }
-
-                padding = to_buffer_end_length;
-            }
-
-            // Exit condition
-            if aeron_cas_i64(
-                self.descriptor.tail_position(),
-                tail,
-                tail + required_capacity as i64 + padding as i64,
-            ) {
-                break;
-            }
-        }
-
-        if padding != 0 {
-            let record_header: &mut RecordDescriptor = {
-                let ptr: *mut u8 = unsafe { self.buffer.as_ptr().byte_add(tail_index) };
-                unsafe { &mut *(ptr as *mut RecordDescriptor) }
-            };
-
-            aeron_put_ordered_i32(&mut record_header.length, -(padding as i32));
-            record_header.msg_type_id = AERON_RB_PADDING_MSG_TYPE_ID;
-            aeron_put_ordered_i32(&record_header.length, padding as i32);
-            tail_index = 0;
-        }
-
-        Ok(tail_index as i32)
-    }
+    //     // return vec
+    //     read_buffer
+    // }
 }
 
 #[repr(C, align(4))]
@@ -243,10 +187,10 @@ fn aeron_put_ordered_i32(dst: &AtomicI32, src: i32) {
     dst.store(src, Ordering::Relaxed);
 }
 
-fn aeron_cas_i64(dst: &AtomicI64, expected: i64, desired: i64) -> bool {
-    let original = dst.compare_and_swap(expected, desired, Ordering::SeqCst);
-    original == expected
-}
+// fn aeron_cas_i64(dst: &AtomicI64, expected: i64, desired: i64) -> bool {
+//     let original = dst.compare_and_swap(expected, desired, Ordering::SeqCst);
+//     original == expected
+// }
 
 // TODO: move somewhere else
 fn is_capacity_valid(capacity: usize, min_capacity: usize) -> bool {
@@ -289,21 +233,22 @@ mod tests {
 
     #[test]
     fn read_write_read_single_message() {
-        const buffer_size: usize = 1024;
-        const length: usize = buffer_size + size_of::<RawDescriptor>();
-        let layout = Layout::from_size_align(length, buffer_size).unwrap();
+        const BUFFER_SIZE: usize = 1024;
+        const LENGTH: usize = BUFFER_SIZE + size_of::<RawDescriptor>();
+        let layout = Layout::from_size_align(LENGTH, BUFFER_SIZE).unwrap();
         let buffer = unsafe { alloc(layout) } as *mut u8;
-        unsafe { buffer.write_bytes(0, buffer_size) };
+        unsafe { buffer.write_bytes(0, BUFFER_SIZE) };
         // let mut buffer = unsafe { MaybeUninit::<[u8; length]>::zeroed().assume_init() };
 
-        let mut reader = unsafe { RingBuffer::new(buffer, buffer_size) }.unwrap();
-        let mut writer = unsafe { RingBuffer::new(buffer, buffer_size) }.unwrap();
+        let (mut sender, mut receiver) = unsafe { RingBuffer::new(buffer, BUFFER_SIZE) }
+            .unwrap()
+            .split();
 
         let message = (88, [54, 33, 77, 11, 123]);
 
-        writer.write(message.0, &message.1).unwrap();
+        sender.send(message.0, &message.1).unwrap();
 
-        let mut received = reader.read(1);
+        let mut received = receiver.receive(1);
 
         assert_eq!(received.len(), 1);
 

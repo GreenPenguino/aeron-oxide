@@ -1,4 +1,21 @@
-use std::{cell::UnsafeCell, mem::size_of, ptr::NonNull, sync::atomic::AtomicI64};
+#![allow(deprecated)]
+
+//! Descriptor.
+//!
+//! The descriptor contains the following fields:
+//! - `tail_position`: end of data, incremented on writes, only ever increasing
+//! - `head_cache_position`
+//! - `head_position`: start of data, incremented on reads, only ever increasing
+//!
+//!
+//!
+//!
+use std::{
+    cell::UnsafeCell,
+    mem::size_of,
+    ptr::NonNull,
+    sync::atomic::{AtomicI64, Ordering},
+};
 
 use crate::AERON_CACHE_LINE_LENGTH;
 
@@ -24,22 +41,25 @@ pub(crate) struct RawDescriptor {
     _consumer_heartbeat_pad: [UnsafeCell<u8>; 2 * AERON_CACHE_LINE_LENGTH - size_of::<AtomicI64>()],
 }
 
-pub(crate) struct Descriptor(NonNull<RawDescriptor>);
+#[derive(Clone, Copy)]
+pub struct Descriptor(NonNull<RawDescriptor>);
 
 impl Descriptor {
     pub fn new(ptr: *mut u8) -> Self {
-        let raw: &RawDescriptor = unsafe { &*(ptr as *mut RawDescriptor) };
-        raw.tail_position
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-        raw.head_cache_position
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-        raw.head_position
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-        raw.correlation_counter
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-        raw.consumer_heartbeat
-            .store(0, std::sync::atomic::Ordering::Release);
         Self(NonNull::new(ptr as *mut RawDescriptor).unwrap())
+    }
+
+    pub fn reset(&self) {
+        self.tail_position()
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.head_cache_position()
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.head_position()
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.correlation_counter()
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.consumer_heartbeat()
+            .store(0, std::sync::atomic::Ordering::Release);
     }
 
     pub fn tail_position(&self) -> &AtomicI64 {
@@ -66,6 +86,189 @@ impl Descriptor {
 impl std::fmt::Debug for Descriptor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self.0)
+    }
+}
+
+pub(crate) struct SenderDescriptor {
+    pub tail_position: ReadWriteTail,
+    pub head_cache_position: ReadWriteHeadCache,
+    pub head_position: ReadOnlyHead,
+}
+
+impl From<Descriptor> for SenderDescriptor {
+    fn from(descriptor: Descriptor) -> Self {
+        Self {
+            tail_position: ReadWriteTail(descriptor.tail_position()),
+            head_cache_position: ReadWriteHeadCache(descriptor.head_cache_position()),
+            head_position: ReadOnlyHead(descriptor.head_position()),
+        }
+    }
+}
+
+pub(crate) struct ReceiverDescriptor {
+    pub tail_position: ReadOnlyTail,
+    pub head_cache_position: ReadOnlyHeadCache,
+    pub head_position: ReadWriteHead,
+}
+
+impl From<Descriptor> for ReceiverDescriptor {
+    fn from(descriptor: Descriptor) -> Self {
+        Self {
+            tail_position: ReadOnlyTail(descriptor.tail_position()),
+            head_cache_position: ReadOnlyHeadCache(descriptor.head_cache_position()),
+            head_position: ReadWriteHead(descriptor.head_position()),
+        }
+    }
+}
+
+pub type Head = i64;
+pub type AtomicHead = AtomicI64;
+pub struct ReadWriteHead(*const AtomicHead);
+pub struct ReadOnlyHead(*const AtomicHead);
+
+pub type HeadCache = i64;
+pub type AtomicHeadCache = AtomicI64;
+pub struct ReadWriteHeadCache(*const AtomicHeadCache);
+pub struct ReadOnlyHeadCache(*const AtomicHeadCache);
+
+pub type Tail = i64;
+pub type AtomicTail = AtomicI64;
+pub struct ReadWriteTail(*const AtomicTail);
+pub struct ReadOnlyTail(*const AtomicTail);
+
+impl ReadWriteHead {
+    pub fn new(ptr: *const AtomicHead) -> Self {
+        Self(ptr)
+    }
+
+    // IDEA: does #[inline(always)] make a difference in benchmarks?
+
+    #[cfg(not(debug_assertions))]
+    pub fn store_atomic(&self, val: Head, ord: Ordering) {
+        let atomic = unsafe {
+            let atomic = &*self.0;
+        };
+
+        atomic.store(val, ord);
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn store_atomic(&self, val: Head, ord: Ordering) {
+        let atomic = unsafe { &*self.0 };
+
+        let old = atomic.swap(val, ord);
+        debug_assert!(val >= old);
+    }
+
+    // IDEA: does #[inline(always)] make a difference in benchmarks?
+    pub fn load_atomic(&self, ord: Ordering) -> Head {
+        let atomic = unsafe { &*self.0 };
+
+        atomic.load(ord)
+    }
+}
+
+impl ReadOnlyHead {
+    pub fn new(ptr: *const AtomicHead) -> Self {
+        Self(ptr)
+    }
+
+    // IDEA: does #[inline(always)] make a difference in benchmarks?
+    pub fn load_atomic(&self, ord: Ordering) -> Head {
+        let atomic = unsafe { &*self.0 };
+
+        atomic.load(ord)
+    }
+}
+
+impl ReadWriteHeadCache {
+    pub fn new(ptr: *const AtomicHead) -> Self {
+        Self(ptr)
+    }
+
+    // IDEA: does #[inline(always)] make a difference in benchmarks?
+    #[cfg(not(debug_assertions))]
+    pub fn store_atomic(&self, val: Head, ord: Ordering) {
+        let atomic = unsafe { &*self.0 };
+
+        atomic.store(val, ord);
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn store_atomic(&self, val: Head, ord: Ordering) {
+        let atomic = unsafe { &*self.0 };
+
+        let old = atomic.swap(val, ord);
+        debug_assert!(val >= old);
+    }
+
+    // IDEA: does #[inline(always)] make a difference in benchmarks?
+    pub fn load_atomic(&self, ord: Ordering) -> HeadCache {
+        let atomic = unsafe { &*self.0 };
+
+        atomic.load(ord)
+    }
+}
+
+impl ReadOnlyHeadCache {
+    pub fn new(ptr: *const AtomicHeadCache) -> Self {
+        Self(ptr)
+    }
+
+    // IDEA: does #[inline(always)] make a difference in benchmarks?
+    pub fn load_atomic(&self, ord: Ordering) -> HeadCache {
+        let atomic = unsafe { &*self.0 };
+
+        atomic.load(ord)
+    }
+}
+
+impl ReadWriteTail {
+    pub fn new(ptr: *const AtomicHead) -> Self {
+        Self(ptr)
+    }
+
+    // IDEA: does #[inline(always)] make a difference in benchmarks?
+    #[cfg(not(debug_assertions))]
+    pub fn store_atomic(&self, val: Head, ord: Ordering) {
+        let atomic = unsafe { &*self.0 };
+
+        atomic.store(val, ord);
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn store_atomic(&self, val: Head, ord: Ordering) {
+        let atomic = unsafe { &*self.0 };
+
+        let old = atomic.swap(val, ord);
+        debug_assert!(val >= old);
+    }
+
+    // IDEA: does #[inline(always)] make a difference in benchmarks?
+    pub fn load_atomic(&self, ord: Ordering) -> Tail {
+        let atomic = unsafe { &*self.0 };
+
+        atomic.load(ord)
+    }
+
+    pub fn cas(&self, expected: i64, desired: i64, ord: Ordering) -> bool {
+        let atomic = unsafe { &*self.0 };
+
+        let original = atomic.compare_and_swap(expected, desired, ord);
+        original == expected
+    }
+}
+
+impl ReadOnlyTail {
+    pub fn new(ptr: *const AtomicTail) -> Self {
+        Self(ptr)
+    }
+
+    // IDEA: does #[inline(always)] make a difference in benchmarks?
+    pub fn read_atomic(&self, ord: Ordering) -> Tail {
+        let atomic = unsafe { &*self.0 };
+
+        atomic.load(ord)
     }
 }
 
