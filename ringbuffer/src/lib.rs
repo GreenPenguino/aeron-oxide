@@ -10,9 +10,13 @@ use descriptor::{Descriptor, RawDescriptor};
 use receiver::Receiver;
 use sender::Sender;
 use std::{
-    mem::size_of,
+    alloc::{alloc, dealloc, Layout},
+    mem::{align_of, size_of},
     ptr::NonNull,
-    sync::atomic::{compiler_fence, AtomicI32, AtomicI64, Ordering},
+    sync::{
+        atomic::{compiler_fence, AtomicI32, AtomicI64, AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 // TODO: move somewhere else (aeron-client/src/main/c/util/aeron_binutil.h)
@@ -31,10 +35,37 @@ pub struct RingBuffer {
     capacity: usize,
     descriptor: Descriptor,
     max_message_length: usize,
+    reference_count: Arc<AtomicUsize>,
 }
 
 impl RingBuffer {
-    pub unsafe fn new(buffer: *mut u8, length: usize) -> Result<Self, ()> {
+    pub fn new(capacity: usize) -> Result<Self, ()> {
+        let length: usize = capacity + AERON_RB_TRAILER_LENGTH;
+
+        if is_capacity_valid(capacity, AERON_MPSC_RB_MIN_CAPACITY) {
+            let layout = Layout::from_size_align(length, align_of::<RawDescriptor>()).unwrap();
+            let buffer = unsafe { alloc(layout) } as *mut u8;
+            Ok(Self {
+                buffer: NonNull::new(buffer).unwrap(),
+                descriptor: {
+                    let descriptor_ptr = unsafe { buffer.byte_add(capacity) };
+                    let descriptor = Descriptor::new(descriptor_ptr);
+                    descriptor.reset();
+                    descriptor
+                },
+                capacity,
+                max_message_length: aeron_rb_max_message_length(
+                    capacity,
+                    AERON_MPSC_RB_MIN_CAPACITY,
+                ),
+                reference_count: Arc::new(AtomicUsize::new(1)),
+            })
+        } else {
+            Err(()) // TODO: create actual error type with "Invalid capacity: {capacity}" message
+        }
+    }
+
+    pub unsafe fn from_memory(buffer: *mut u8, length: usize) -> Result<Self, ()> {
         let capacity: usize = length - AERON_RB_TRAILER_LENGTH;
 
         if is_capacity_valid(capacity, AERON_MPSC_RB_MIN_CAPACITY) {
@@ -46,6 +77,7 @@ impl RingBuffer {
                     capacity,
                     AERON_MPSC_RB_MIN_CAPACITY,
                 ),
+                reference_count: Arc::new(AtomicUsize::new(2)), // This reference + original allocator
             })
         } else {
             Err(()) // TODO: create actual error type with "Invalid capacity: {capacity}" message
@@ -53,18 +85,21 @@ impl RingBuffer {
     }
 
     pub fn split(self) -> (Sender, Receiver) {
+        self.reference_count.fetch_add(1, Ordering::Relaxed); // By splitting the refcount is increased by one
         (
             Sender {
                 buffer: self.buffer,
                 capacity: self.capacity,
                 descriptor: self.descriptor.into(),
                 max_message_length: self.max_message_length,
+                reference_count: self.reference_count.clone(),
             },
             Receiver {
                 buffer: self.buffer,
                 capacity: self.capacity,
                 descriptor: self.descriptor.into(),
                 _max_message_length: self.max_message_length,
+                reference_count: self.reference_count.clone(),
             },
         )
     }
@@ -152,11 +187,27 @@ impl RingBuffer {
     // }
 }
 
+impl Drop for RingBuffer {
+    fn drop(&mut self) {
+        if self.reference_count.fetch_sub(1, Ordering::Relaxed) == 0 {
+            unsafe {
+                free_buffer(self.buffer, self.capacity);
+            }
+        }
+    }
+}
+
+unsafe fn free_buffer(buffer: NonNull<u8>, capacity: usize) {
+    let length = capacity + AERON_RB_TRAILER_LENGTH;
+    let layout = Layout::from_size_align(length, align_of::<RawDescriptor>())
+        .expect("expect to create the same layout as used for allocation");
+    unsafe { dealloc(buffer.as_ptr(), layout) };
+}
+
 #[repr(C, align(4))]
 struct RecordDescriptor {
-    // Length should probably be an atomic
     length: AtomicI32,
-    msg_type_id: i32,
+    msg_type_id: AtomicI32,
 }
 
 // TODO: move somewhere else
@@ -219,24 +270,11 @@ fn aeron_align(value: usize, alignment: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::alloc::alloc;
-    use std::alloc::Layout;
-
-    use crate::AERON_RB_TRAILER_LENGTH;
-
     use super::RingBuffer;
 
     #[test]
     fn read_write_read_single_message() {
-        const BUFFER_SIZE: usize = 1024;
-        const LENGTH: usize = BUFFER_SIZE + AERON_RB_TRAILER_LENGTH;
-        let layout = Layout::from_size_align(LENGTH, BUFFER_SIZE).unwrap();
-        let buffer = unsafe { alloc(layout) } as *mut u8;
-        unsafe { buffer.write_bytes(0, BUFFER_SIZE) };
-
-        let (mut sender, mut receiver) = unsafe { RingBuffer::new(buffer, BUFFER_SIZE) }
-            .unwrap()
-            .split();
+        let (mut sender, mut receiver) = RingBuffer::new(1024).unwrap().split();
 
         let message = (88, [54, 33, 77, 11, 123]);
 
@@ -253,12 +291,7 @@ mod tests {
 
     #[test]
     fn read_write_read_multiple_messages() {
-        let mut buffer = [0u8; 1024 + AERON_RB_TRAILER_LENGTH];
-
-        let (mut sender, mut receiver) =
-            unsafe { RingBuffer::new(buffer.as_mut_ptr(), buffer.len()) }
-                .unwrap()
-                .split();
+        let (mut sender, mut receiver) = RingBuffer::new(1024).unwrap().split();
 
         let message_one = (88, [54, 33, 77, 11, 123]);
 
@@ -287,18 +320,15 @@ mod tests {
 
     #[test]
     fn write_read_single_message_multithread() {
-        let mut buffer = [0u8; 1024 + AERON_RB_TRAILER_LENGTH];
-
         std::thread::scope(|s| {
-            let (mut sender, mut receiver) =
-                unsafe { RingBuffer::new(buffer.as_mut_ptr(), buffer.len()) }
-                    .unwrap()
-                    .split();
+            let (mut sender, mut receiver) = RingBuffer::new(1024).unwrap().split();
 
-            s.spawn(move || {
+            let t = s.spawn(move || {
                 let message = (88, [54, 33, 77, 11, 123]);
                 sender.send(message.0, &message.1).unwrap();
             });
+
+            t.join().unwrap();
 
             s.spawn(move || {
                 let mut received = receiver.receive(1);

@@ -12,7 +12,7 @@
 //!
 use std::{
     cell::UnsafeCell,
-    mem::size_of,
+    mem::{align_of, size_of},
     ptr::NonNull,
     sync::atomic::{AtomicI64, Ordering},
 };
@@ -46,6 +46,7 @@ pub struct Descriptor(NonNull<RawDescriptor>);
 
 impl Descriptor {
     pub fn new(ptr: *mut u8) -> Self {
+        assert_eq!(ptr.align_offset(align_of::<RawDescriptor>()), 0);
         Self(NonNull::new(ptr as *mut RawDescriptor).unwrap())
     }
 

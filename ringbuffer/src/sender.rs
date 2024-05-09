@@ -1,11 +1,14 @@
 use std::{
     ptr::{self, NonNull},
-    sync::atomic::{compiler_fence, Ordering},
+    sync::{
+        atomic::{compiler_fence, AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 use crate::{
     aeron_align, aeron_put_ordered_i32, aeron_rb_invalid_msg_type_id, aeron_rb_message_offset,
-    descriptor::SenderDescriptor, RecordDescriptor, AERON_RB_ALIGNMENT,
+    descriptor::SenderDescriptor, free_buffer, RecordDescriptor, AERON_RB_ALIGNMENT,
     AERON_RB_PADDING_MSG_TYPE_ID, AERON_RB_RECORD_HEADER_LENGTH,
 };
 
@@ -15,6 +18,7 @@ pub struct Sender {
     pub(crate) capacity: usize,
     pub(crate) descriptor: SenderDescriptor,
     pub(crate) max_message_length: usize,
+    pub(crate) reference_count: Arc<AtomicUsize>,
 }
 
 unsafe impl Send for Sender {}
@@ -49,7 +53,9 @@ impl Sender {
         let destination_ptr: *mut u8 = unsafe { self.buffer.as_ptr().byte_add(index) };
         unsafe { ptr::copy_nonoverlapping(msg.as_ptr(), destination_ptr, msg.len()) };
 
-        unsafe { &mut *record_header }.msg_type_id = msg_type_id;
+        unsafe { &*record_header }
+            .msg_type_id
+            .store(msg_type_id, Ordering::Relaxed);
         aeron_put_ordered_i32(&unsafe { &*record_header }.length, record_length as i32);
 
         Ok(())
@@ -167,11 +173,23 @@ impl Sender {
 
             // TODO: get rid of aeron_put_ordered_i32
             aeron_put_ordered_i32(&mut record_header.length, -(padding as i32));
-            record_header.msg_type_id = AERON_RB_PADDING_MSG_TYPE_ID;
+            record_header
+                .msg_type_id
+                .store(AERON_RB_PADDING_MSG_TYPE_ID, Ordering::Relaxed);
             aeron_put_ordered_i32(&record_header.length, padding as i32);
             tail_index = 0;
         }
 
         Ok(tail_index as i32)
+    }
+}
+
+impl Drop for Sender {
+    fn drop(&mut self) {
+        if self.reference_count.fetch_sub(1, Ordering::Relaxed) == 0 {
+            unsafe {
+                free_buffer(self.buffer, self.capacity);
+            }
+        }
     }
 }

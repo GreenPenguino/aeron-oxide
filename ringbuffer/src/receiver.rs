@@ -1,12 +1,16 @@
 use std::{
     ptr::NonNull,
     slice,
-    sync::atomic::{compiler_fence, Ordering},
+    sync::{
+        atomic::{compiler_fence, AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 use crate::{
-    aeron_align, aeron_rb_message_offset, descriptor::ReceiverDescriptor, RecordDescriptor,
-    AERON_RB_ALIGNMENT, AERON_RB_PADDING_MSG_TYPE_ID, AERON_RB_RECORD_HEADER_LENGTH,
+    aeron_align, aeron_rb_message_offset, descriptor::ReceiverDescriptor, free_buffer,
+    RecordDescriptor, AERON_RB_ALIGNMENT, AERON_RB_PADDING_MSG_TYPE_ID,
+    AERON_RB_RECORD_HEADER_LENGTH,
 };
 
 // IDEA: capacity could be a const generic (<const N: usize>)
@@ -15,6 +19,7 @@ pub struct Receiver {
     pub(crate) capacity: usize,
     pub(crate) descriptor: ReceiverDescriptor,
     pub(crate) _max_message_length: usize,
+    pub(crate) reference_count: Arc<AtomicUsize>,
 }
 
 unsafe impl Send for Receiver {}
@@ -52,7 +57,7 @@ impl Receiver {
             }
 
             bytes_read += aeron_align(record_length as usize, AERON_RB_ALIGNMENT);
-            let msg_type_id: i32 = header.msg_type_id;
+            let msg_type_id: i32 = header.msg_type_id.load(Ordering::Relaxed);
 
             if msg_type_id == AERON_RB_PADDING_MSG_TYPE_ID {
                 continue;
@@ -89,5 +94,15 @@ impl Receiver {
 
         // return vec
         read_buffer
+    }
+}
+
+impl Drop for Receiver {
+    fn drop(&mut self) {
+        if self.reference_count.fetch_sub(1, Ordering::Relaxed) == 0 {
+            unsafe {
+                free_buffer(self.buffer, self.capacity);
+            }
+        }
     }
 }
